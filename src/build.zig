@@ -28,6 +28,7 @@ pub fn addRaylib(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .shared = options.shared,
         .linux_display_backend = options.linux_display_backend,
         .opengl_version = options.opengl_version,
+        .config = options.config,
     });
     const raylib = raylib_dep.artifact("raylib");
 
@@ -37,6 +38,83 @@ pub fn addRaylib(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     }
 
     return raylib;
+}
+
+fn gen_header(b: *std.Build, options: Options) !void {
+    const h_path = b.path("src/config.h");
+    const h_path_abs = h_path.getPath(b);
+
+    const h_orig_path = b.path("src/config.orig.h");
+    const h_orig_path_abs = h_orig_path.getPath(b);
+    
+    // make backup if not exists
+    blk: {
+        const maybe_h_orig = std.fs.openFileAbsolute(h_orig_path_abs, .{});
+
+        const h_orig = maybe_h_orig catch {
+            break :blk try std.fs.renameAbsolute(h_path_abs, h_orig_path_abs);
+        };
+        h_orig.close();
+    }
+
+    const h_file = try std.fs.createFileAbsolute(
+        h_path_abs,
+        .{},
+    );
+    defer h_file.close();
+    const file_writer = h_file.writer();
+
+    try file_writer.print("#ifndef CONFIG_H\n#define CONFIG_H\n\n", .{});
+    defer file_writer.print("\n#endif\n", .{}) catch unreachable;
+
+    inline for (@typeInfo(ConfigHeaderOptions).Struct.fields) |field| {
+        const value = @field(options.config, field.name);
+        const v_type = @TypeOf(value);
+        const t_info = @typeInfo(v_type);
+
+        blk: {
+            const val = if(t_info == .Optional) val: {
+                if (value) |v| break :val v else break :blk;
+            } else val: {
+                break :val value;
+            };
+
+            var buf: [128]u8 = undefined;
+            switch (@TypeOf(val)) {
+                bool => {
+                    const str = std.ascii.upperString(&buf, field.name);
+                    if (val){
+                        try file_writer.print("#define {s} 1\n", .{str});
+                    } else {
+                        std.debug.print("option: {s} should be omitted\n", .{ str });
+                    }
+                },
+                i32 => {
+                    const str = std.ascii.upperString(&buf, field.name);
+                    try file_writer.print("#define {s} {d}\n", .{str, val});
+                },
+                f32 => {
+                    const str = std.ascii.upperString(&buf, field.name);
+                    try file_writer.print("#define {s} {d:.2}\n", .{str, val});
+                },
+                []const u8 => {
+                    const str = std.ascii.upperString(&buf, field.name);
+                    try file_writer.print("#define {s} \"{s}\"\n", .{str, val});
+                },
+                ConfigHeaderOptions.ma_formats => {
+                    const str = std.ascii.upperString(&buf, field.name);
+                    try file_writer.print("#define {s} {s}\n", .{str, @tagName(val)});
+                },
+                ConfigHeaderOptions.AppendF => {
+                    const str = std.ascii.upperString(&buf, field.name);
+                    try file_writer.print("#define {s} {d:.2}f\n", .{str, val.val});
+                },
+                else => {
+                    @compileLog("Err: Received unhandled type: ", @TypeOf(val));
+                },
+            }
+        }
+    }
 }
 
 fn compileRaylib(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, options: Options) !*std.Build.Step.Compile {
@@ -77,70 +155,8 @@ fn compileRaylib(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
 
     // Generate config header && Back up original to `config.orig.h` if still present
     {
-        const config_path = b.path("src/config.h");
-        const config_path_abs = config_path.getPath(b);
-
-        const config_orig_path = b.path("src/config.orig.h");
-        const config_orig_path_abs = config_orig_path.getPath(b);
-
-        std.debug.print("  :: paths ::\n   conf: {s}\n   orig: {s}\n", .{ config_path_abs, config_orig_path_abs });
-
-        blk: {
-            const maybe_config_orig = std.fs.openFileAbsolute(config_orig_path_abs, .{});
-
-            const config_orig = maybe_config_orig catch {
-                break: blk try std.fs.renameAbsolute(config_path_abs, config_orig_path_abs);
-            };
-            config_orig.close();
-        }
-
-        const config_h = try std.fs.createFileAbsolute(config_path_abs, .{});
-        defer config_h.close();
-        const config_h_writer = config_h.writer();
-        try config_h_writer.print("#ifndef CONFIG_H \n#define CONFIG_H\n\n", .{});
-        defer config_h_writer.print("\n#endif\n", .{}) catch unreachable;
-
-        inline for (@typeInfo(ConfigHeaderOptions).Struct.fields) |field| {
-            const value = @field(options.config, field.name);
-            const v_type = @TypeOf(value);
-            const vt_info = @typeInfo(v_type);
-
-            const val = blk: {
-                if (vt_info == .Optional) {
-                    if (value) |v| break :blk v else continue;
-                } else {
-                    break :blk value;
-                }
-            };
-            var buf: [128]u8 = undefined;
-            switch (@TypeOf(val)) {
-                bool => {
-                    if (value) try config_h_writer.print("#define {s} {d}\n", .{ std.ascii.upperString(&buf, field.name), 1 });
-                },
-                i32 => {
-                    try config_h_writer.print("#define {s} {d}\n", .{ std.ascii.upperString(&buf, field.name), value });
-                },
-                f32 => {
-                    try config_h_writer.print("#define {s} {d:.2}\n", .{ std.ascii.upperString(&buf, field.name), value });
-                },
-                ConfigHeaderOptions.AppendF => {
-                    try config_h_writer.print("#define {s} {d:.2}f\n", .{ std.ascii.upperString(&buf, field.name), value.val });
-                },
-                ConfigHeaderOptions.ma_formats => {
-                    try config_h_writer.print("#define {s} {s}\n", .{ std.ascii.upperString(&buf, field.name), @tagName(value) });
-                },
-                []const u8 => {
-                    try config_h_writer.print("#define {s} \"{s}\"\n", .{ std.ascii.upperString(&buf, field.name), value });
-                },
-                else => {
-                    std.debug.print("type: {any}\n", .{v_type});
-                    @compileError("invalid type provided");
-                },
-            }
-        }
+        try gen_header(b, options);
     }
-
-
     var c_source_files = try std.ArrayList([]const u8).initCapacity(b.allocator, 2);
     c_source_files.appendSliceAssumeCapacity(&.{ "rcore.c", "utils.c" });
 
@@ -351,7 +367,7 @@ pub const LinuxDisplayBackend = enum {
     Both,
 };
 
-const ConfigHeaderOptions = struct {
+pub const ConfigHeaderOptions = struct {
     pub const ma_formats = enum {
         ma_format_unknown,
         ma_format_u8,
